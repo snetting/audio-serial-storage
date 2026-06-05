@@ -25,6 +25,12 @@ Features
 -   **Preserve and restore file metadata:** timestamps, ownership, and permissions
 
 -   **Experimental** MFSK 2,4,8,16 support
+
+-   **Automatic decode detection** for common symbol rates and FSK/MFSK modes when `--bitrate` or `--mfsk` is omitted
+
+-   **Improved sync and timing recovery** using preamble correlation, tone-speed estimation, adaptive PLL candidate demodulation, and RS/CRC validation
+
+-   **Optional burst-error mitigation** via byte interleaving (`--interleave-depth`) and periodic resync markers (`--resync-interval`)
 * * * * *
 
 Serial Data Structure
@@ -48,7 +54,20 @@ Each packet on the wire is arranged as follows (all multi‑byte fields big‑en
 | 32+N   | 4      | CRC32 of payload                      |
 | 36+N   | M      | Payload (compressed or raw data)      |
 
-After framing, each byte goes through Reed--Solomon → FSK → WAV.
+After framing, each byte goes through Reed--Solomon -> optional byte interleaving -> optional resync marker insertion -> FSK/MFSK -> WAV.
+
+The packet header intentionally remains `ASS1` for compatibility. It records payload compression but does **not** record the audio modulation mode. That is useful only after demodulation, so the decoder now detects mode from the audio layer before parsing the packet.
+
+Compatibility Notes
+-------------------
+
+- Default encoding remains compatible with older decoders: no interleaving and no resync markers are inserted unless explicitly requested.
+
+- `--interleave-depth` values greater than `1` are not backward compatible. New decoders must be told the depth, or decode with `--auto-interleave`.
+
+- `--resync-interval N` is not backward compatible. New decoders strip the 64-bit resync marker automatically, but old decoders will treat those marker bits as payload.
+
+- Decode-side auto-detection does not change the wire format. It tries common symbol rates and MFSK tone counts, then accepts only candidates that pass Reed--Solomon and CRC validation.
 
 * * * * *
 
@@ -87,7 +106,8 @@ Usage
 usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
              [--bitrate BITRATE] [--mfsk {2,4,8,16}]
              [--alwayscompress | --nocompress | --autocompress] 
-             [--noclamp] file
+             [--noclamp] [--interleave-depth N] [--auto-interleave]
+             [--resync-interval N] file
 ```
 
 -   **Positional arguments**:
@@ -104,11 +124,17 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
     -   `--inputfile FILE` : Path to input file to encode
 
-    -   `--bitrate BITRATE` : Bitrate in bits/sec (default: 1200)
+    -   `--bitrate BITRATE` : Symbol rate. Encoding defaults to 1200; decoding auto-detects when omitted.
     
     -   `--mfsk {2,4,8,16}` : Number of tones (2 = standard FSK; 4/8/16 = experimental MFSK)
 
-    -   `--noclamp` : bypass bitrate clamping (use with care!
+    -   `--noclamp` : bypass bitrate clamping (use with care!)
+
+    -   `--interleave-depth N` : optional byte interleaver depth. `1` is compatible/default; values greater than `1` require a new decoder.
+
+    -   `--auto-interleave` : on decode, try common interleave depths.
+
+    -   `--resync-interval N` : insert a 64-bit resync marker every N Reed--Solomon encoded bytes. Disabled by default; requires a new decoder.
 
     -   **Compression modes** (mutually exclusive):
 
@@ -130,17 +156,24 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 # Encode without compression
 ./ass.py encode output.wav --inputfile example.bin --bitrate 2400 --nocompress
 
-# Decode from file
-./ass.py decode input.wav --bitrate 2400 
+# Decode from file with explicit settings
+./ass.py decode input.wav --bitrate 1200 --mfsk 2
+
+# Decode from file with auto-detection
+./ass.py decode input.wav
 
 # Decode live from mic
-./ass.py decode - --bitrate 2400 
+./ass.py decode - --bitrate 1200 --mfsk 2
 
 # Experimental 8-FSK at 100 bps bit-rate (effectively 300 bps)
 ./ass.py encode out-mfsk.wav --inputfile data.bin --bitrate 100 --mfsk 8
 
 # Decode a 16-FSK transmission
-./ass.py decode in-mfsk16.wav --bitrate 1200 --mfsk 16
+./ass.py decode in-mfsk16.wav --bitrate 80 --mfsk 16
+
+# Optional interleaving for burst-error resilience (new decoder required)
+./ass.py encode interleaved.wav --inputfile data.bin --interleave-depth 8
+./ass.py decode interleaved.wav --auto-interleave
 
 ```
 
@@ -167,6 +200,22 @@ Add `--noclamp` to bypass the clamp (you’ll still see the warning, but ASS wil
 
 Decoded files are written with their original names, metadata, ownership, and permissions.
 
+Sync And Timing Recovery
+------------------------
+
+Older versions demodulated using fixed symbol windows derived directly from the requested bitrate. That works for clean WAV files but fails quickly when tape or record/replay hardware adds leading silence, speed error, or timing drift.
+
+The decoder now:
+
+- trims leading/trailing silence using an RMS envelope
+- locks to the preamble and sync word by testing symbol phase and samples-per-symbol candidates
+- estimates constant playback speed error from the 1200/2400 Hz tone locations
+- tries fixed and adaptive PLL-style demodulation candidates
+- validates the final candidate with Reed--Solomon and payload CRC32
+- can recover when the end marker is damaged by searching valid Reed--Solomon encoded prefixes
+
+This is a practical improvement, not a guarantee against severe tape wow/flutter. Very unstable playback can still exceed the correction range, but modest synthetic speed error and wow/flutter are covered by automated tests.
+
 * * * * *
 
 Inspiration
@@ -190,11 +239,9 @@ This code was partially generated and reviewed with the assistance of a large la
 To Do
 -----
 
--   Add **MFSK encoding** to increase data rates (in progress / Experimental)
+-   Continue improving real-world tape tests with aged media and consumer recorders
 
--   Improve burst‑error handling with interleaving
-
--   Implement proper sync and timing recovery (e.g., PLL)
+-   Tune PLL loop constants against captured bad tapes rather than only synthetic tests
 
 -   (Optional) GUI
 
