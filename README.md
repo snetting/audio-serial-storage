@@ -107,7 +107,8 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
              [--bitrate BITRATE] [--mfsk {2,4,8,16}]
              [--alwayscompress | --nocompress | --autocompress] 
              [--noclamp] [--interleave-depth N] [--auto-interleave]
-             [--resync-interval N] file
+             [--resync-interval N] [--brute-force-recovery]
+             [--overwrite] file
 ```
 
 -   **Positional arguments**:
@@ -124,9 +125,9 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
     -   `--inputfile FILE` : Path to input file to encode
 
-    -   `--bitrate BITRATE` : Symbol rate. Encoding defaults to 1200; decoding auto-detects when omitted.
+    -   `--bitrate BITRATE` : Symbol rate. Encoding defaults to 1200. Decoding auto-detects only when both `--bitrate` and `--mfsk` are omitted.
     
-    -   `--mfsk {2,4,8,16}` : Number of tones (2 = standard FSK; 4/8/16 = experimental MFSK)
+    -   `--mfsk {2,4,8,16}` : Number of tones (2 = standard FSK; 4/8/16 = experimental MFSK). If only `--bitrate` is specified while decoding, `--mfsk` defaults to 2.
 
     -   `--noclamp` : bypass bitrate clamping (use with care!)
 
@@ -135,6 +136,10 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
     -   `--auto-interleave` : on decode, try common interleave depths.
 
     -   `--resync-interval N` : insert a 64-bit resync marker every N Reed--Solomon encoded bytes. Disabled by default; requires a new decoder.
+
+    -   `--brute-force-recovery` : enable slow RS-prefix recovery when header-based recovery fails. This is intended for damaged captures and can be CPU-intensive on long recordings.
+
+    -   `--overwrite` : when decoding, overwrite an existing output file. By default the decoder adds a numeric suffix to avoid clobbering files.
 
     -   **Compression modes** (mutually exclusive):
 
@@ -158,6 +163,9 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
 # Decode from file with explicit settings
 ./ass.py decode input.wav --bitrate 1200 --mfsk 2
+
+# Decode from file with explicit bitrate and default 2-FSK
+./ass.py decode input.wav --bitrate 1200
 
 # Decode from file with auto-detection
 ./ass.py decode input.wav
@@ -200,6 +208,13 @@ Add `--noclamp` to bypass the clamp (you’ll still see the warning, but ASS wil
 
 Decoded files are written with their original names, metadata, ownership, and permissions.
 
+Restore Location
+----------------
+
+The packet stores the original filename only as a basename, not a full source path. Decode therefore restores files into the current working directory.
+
+By default, decode will not overwrite an existing file. If `README.md` already exists, a decoded `README.md` is written as `README.1.md`, then `README.2.md`, and so on. Use `--overwrite` only when replacement is intentional.
+
 Sync And Timing Recovery
 ------------------------
 
@@ -213,6 +228,8 @@ The decoder now:
 - tries fixed and adaptive PLL-style demodulation candidates
 - validates the final candidate with Reed--Solomon and payload CRC32
 - can recover when the end marker is damaged by searching valid Reed--Solomon encoded prefixes
+
+Normal decoding first uses header-based RS sizing, which keeps long recordings fast. `--brute-force-recovery` enables a slower RS-prefix search for severe damage; the decoder prints candidate progress so this mode does not appear hung.
 
 This is a practical improvement, not a guarantee against severe tape wow/flutter. Very unstable playback can still exceed the correction range, but modest synthetic speed error and wow/flutter are covered by automated tests.
 

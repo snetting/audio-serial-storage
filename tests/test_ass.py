@@ -95,6 +95,59 @@ class AssRoundTripTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result.payload, b"wow flutter test")
 
+    def test_explicit_bitrate_defaults_to_2fsk_for_long_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            wav_path = os.path.join(td, "out.wav")
+            payload = bytes((i * 37 + 11) % 256 for i in range(4096))
+            packet = ass.build_packet("payload.bin", payload, 0)
+            ass.encode(packet, wav_path, bitrate=1200, mfsk=2)
+            signal, sample_rate = read_wav(wav_path)
+
+            result = ass.decode_signal(signal, bitrate=1200, mfsk=2, sample_rate=sample_rate,
+                                       interleave_depth=1, auto=False, write_output=False)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.payload, payload)
+            self.assertEqual(result.bitrate, 1200)
+            self.assertEqual(result.mfsk, 2)
+
+    def test_decode_does_not_overwrite_existing_output_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                with open("payload.bin", "wb") as fh:
+                    fh.write(b"existing")
+
+                result = ass.DecodeResult(
+                    filename="payload.bin",
+                    payload=b"decoded",
+                    crc=0,
+                    backup_ts=0,
+                    ctime=0,
+                    mtime=0,
+                    uid=0,
+                    gid=0,
+                    mode=0,
+                    flags=0,
+                    bitrate=1200,
+                    mfsk=2,
+                    interleave_depth=1,
+                    resync_markers=0,
+                    demodulator="fixed",
+                    rs_stats={"total_blocks": 1, "symbols_corrected": 0, "uncorrectable_blocks": 0},
+                    score=100,
+                )
+
+                ass.finish_decode(result, write_output=True)
+
+                with open("payload.bin", "rb") as fh:
+                    self.assertEqual(fh.read(), b"existing")
+                with open("payload.1.bin", "rb") as fh:
+                    self.assertEqual(fh.read(), b"decoded")
+            finally:
+                os.chdir(old_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()

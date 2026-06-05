@@ -56,6 +56,10 @@ class DecodeResult:
     score: float
 
 
+ALLOW_BRUTE_FORCE_RECOVERY = False
+ALLOW_OVERWRITE = False
+
+
 def int_to_bits(value: int, nbits: int) -> list[int]:
     return [(value >> (nbits - 1 - i)) & 1 for i in range(nbits)]
 
@@ -363,6 +367,44 @@ def demodulate_symbols(signal: np.ndarray, sample_rate: int, mfsk: int,
     return symbols
 
 
+def demodulate_symbols_fast(signal: np.ndarray, sample_rate: int, mfsk: int,
+                            sps: float, phase: float) -> list[int]:
+    """Fast fixed-clock detector for candidate validation on long files."""
+    freqs = get_mfsk_freqs(mfsk)
+    half = max(4, int(round(sps * 0.45)))
+    win_len = 2 * half
+    window = np.hanning(win_len)
+    refs = []
+    t = np.arange(win_len) / float(sample_rate)
+    for freq in freqs:
+        refs.append((
+            np.sin(2 * np.pi * freq * t) * window,
+            np.cos(2 * np.pi * freq * t) * window,
+        ))
+
+    symbols = []
+    center = float(phase)
+    while center + half < len(signal):
+        c = int(round(center))
+        start = c - half
+        end = c + half
+        if start < 0:
+            chunk = np.pad(signal[0:end], (-start, 0), "constant")
+        elif end > len(signal):
+            chunk = np.pad(signal[start:len(signal)], (0, end - len(signal)), "constant")
+        else:
+            chunk = signal[start:end]
+        x = chunk.astype(np.float64)
+        powers = []
+        for sin_ref, cos_ref in refs:
+            i_val = float(np.dot(x, sin_ref))
+            q_val = float(np.dot(x, cos_ref))
+            powers.append(i_val * i_val + q_val * q_val)
+        symbols.append(int(np.argmax(powers)))
+        center += sps
+    return symbols
+
+
 def score_lock(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: int,
                rel_span: float = 0.08) -> tuple[float, float, float]:
     target_bits = PREAMBLE_BITS + int_to_bits(SYNC_WORD, 32)
@@ -426,10 +468,11 @@ def lock_grids(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: int) ->
         return []
 
     nominal_sps = sample_rate / float(bitrate)
-    centers = [lock_sps, nominal_sps]
+    centers = []
     speed_factor = estimate_tone_speed_factor(signal, sample_rate)
     if speed_factor:
         centers.append(nominal_sps / speed_factor)
+    centers.extend([lock_sps, nominal_sps])
 
     grids = []
     seen = set()
@@ -485,9 +528,15 @@ def decode_candidate(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: i
                      interleave_depth: int, use_pll: bool) -> DecodeResult | None:
     demod_name = "pll" if use_pll else "fixed"
     best = None
-    for sps, phases in lock_grids(signal, sample_rate, bitrate, mfsk):
+    grids = lock_grids(signal, sample_rate, bitrate, mfsk)
+    if use_pll:
+        grids = grids[:3]
+    for sps, phases in grids:
         for phase in phases:
-            symbols = demodulate_symbols(signal, sample_rate, mfsk, sps, phase, pll=use_pll)
+            if use_pll:
+                symbols = demodulate_symbols(signal, sample_rate, mfsk, sps, phase, pll=True)
+            else:
+                symbols = demodulate_symbols_fast(signal, sample_rate, mfsk, sps, phase)
             bits = symbols_to_bits(symbols, mfsk)
             sync_pos = find_pattern(bits, int_to_bits(SYNC_WORD, 32))
             if sync_pos is None:
@@ -497,8 +546,6 @@ def decode_candidate(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: i
             data_bits, removed = strip_resync_markers(data_bits)
             end_pattern = int_to_bits(END_MARKER_WORD, 32) * 3
             end_idx = find_pattern(data_bits, end_pattern)
-            if end_idx is None:
-                end_idx = find_pattern(data_bits, int_to_bits(END_MARKER_WORD, 32))
             if end_idx is not None:
                 data_bits = data_bits[:end_idx]
 
@@ -551,9 +598,67 @@ def possible_rs_lengths(raw_len: int) -> list[int]:
     return lengths
 
 
+def packet_total_length_from_header(decoded_prefix: bytes) -> int | None:
+    if len(decoded_prefix) < 36 or decoded_prefix[:4] != b"ASS1":
+        return None
+    name_len = decoded_prefix[4]
+    header_len = 36 + name_len
+    if len(decoded_prefix) < header_len:
+        return None
+    payload_len = int.from_bytes(decoded_prefix[28 + name_len:32 + name_len], "big")
+    return header_len + payload_len
+
+
+def rs_encoded_length_for_decoded_length(decoded_len: int) -> int:
+    full_blocks, tail = divmod(decoded_len, RS_K)
+    encoded_len = full_blocks * (RS_K + RS_NSYM)
+    if tail:
+        encoded_len += tail + RS_NSYM
+    return encoded_len
+
+
+def try_decode_by_header(raw_stream: bytes, interleave_depth: int) -> tuple[int, bytes, dict] | None:
+    if interleave_depth != 1:
+        return None
+    cw_len = RS_K + RS_NSYM
+    max_probe = min(len(raw_stream), cw_len * 2)
+    probe_len = cw_len
+    while probe_len <= max_probe:
+        decoded_prefix, stats = rs_decode_blocks(raw_stream[:probe_len])
+        if stats["uncorrectable_blocks"]:
+            return None
+        packet_len = packet_total_length_from_header(decoded_prefix)
+        if packet_len is not None:
+            raw_len = rs_encoded_length_for_decoded_length(packet_len)
+            if raw_len > len(raw_stream):
+                return None
+            decoded, final_stats = rs_decode_blocks(raw_stream[:raw_len])
+            try:
+                parsed = parse_packet(decoded)
+            except Exception:
+                return None
+            payload = parsed[1]
+            crc = parsed[2]
+            if (zlib.crc32(payload) & 0xFFFFFFFF) == crc:
+                return raw_len, decoded, final_stats
+            return None
+        probe_len += cw_len
+    return None
+
+
 def try_decode_raw_stream(raw_stream: bytes, interleave_depth: int,
                           require_exact: bool) -> tuple[int, bytes, dict] | None:
-    lengths = [len(raw_stream)] if require_exact else possible_rs_lengths(len(raw_stream))
+    by_header = try_decode_by_header(raw_stream, interleave_depth)
+    if by_header:
+        return by_header
+    if not require_exact and len(raw_stream) > 2048 and not ALLOW_BRUTE_FORCE_RECOVERY:
+        return None
+    if require_exact:
+        lengths = [len(raw_stream)]
+    else:
+        max_extra = 2 * (RS_K + RS_NSYM)
+        min_len = max(1, len(raw_stream) - max_extra)
+        lengths = [n for n in possible_rs_lengths(len(raw_stream)) if n >= min_len]
     for raw_len in lengths:
         raw = raw_stream[:raw_len]
         raw = deinterleave_bytes(raw, interleave_depth)
@@ -573,35 +678,52 @@ def try_decode_raw_stream(raw_stream: bytes, interleave_depth: int,
 
 def decode_signal(signal: np.ndarray, bitrate: int | None, mfsk: int | None,
                   sample_rate: int = SAMPLE_RATE, interleave_depth: int | None = 1,
-                  auto: bool = False, write_output: bool = True) -> DecodeResult | None:
+                  auto: bool = False, write_output: bool = True,
+                  brute_force_recovery: bool = False,
+                  overwrite: bool = False) -> DecodeResult | None:
+    global ALLOW_BRUTE_FORCE_RECOVERY
+    global ALLOW_OVERWRITE
+    old_brute_force = ALLOW_BRUTE_FORCE_RECOVERY
+    old_overwrite = ALLOW_OVERWRITE
+    ALLOW_BRUTE_FORCE_RECOVERY = brute_force_recovery
+    ALLOW_OVERWRITE = overwrite
     signal = trim_active_region(signal, sample_rate)
     bitrates = [bitrate] if bitrate else COMMON_BITRATES
     mfsk_values = [mfsk] if mfsk else COMMON_MFSK
     depths = [interleave_depth] if interleave_depth else [1, 4, 8, 16]
 
-    candidates = []
-    for br in bitrates:
-        for tones in mfsk_values:
-            max_br = max_reliable_bitrate(tones)
-            if br > max_br:
-                continue
-            print(f"[DECODE] Trying {br} symbols/s, {tones}-FSK")
-            for depth in depths:
-                for use_pll in (False, True):
-                    result = decode_candidate(signal, sample_rate, br, tones, depth, use_pll)
-                    if result:
-                        candidates.append(result)
-                        print(f"[DECODE] Candidate OK: {br} symbols/s, {tones}-FSK, "
-                              f"depth {depth}, {result.demodulator}")
-                        if not auto or result.score >= 120:
-                            return finish_decode(result, write_output)
+    try:
+        candidates = []
+        total = sum(1 for br in bitrates for tones in mfsk_values if br <= max_reliable_bitrate(tones))
+        idx = 0
+        if brute_force_recovery:
+            print("[DECODE] Brute-force recovery enabled; this can be slow on long recordings.")
+        for br in bitrates:
+            for tones in mfsk_values:
+                max_br = max_reliable_bitrate(tones)
+                if br > max_br:
+                    continue
+                idx += 1
+                print(f"[DECODE] Candidate {idx}/{total}: {br} symbols/s, {tones}-FSK")
+                for depth in depths:
+                    for use_pll in (False, True):
+                        result = decode_candidate(signal, sample_rate, br, tones, depth, use_pll)
+                        if result:
+                            candidates.append(result)
+                            print(f"[DECODE] Candidate OK: {br} symbols/s, {tones}-FSK, "
+                                  f"depth {depth}, {result.demodulator}")
+                            if not auto or result.score >= 120:
+                                return finish_decode(result, write_output)
 
-    if not candidates:
-        print("[DECODE] No valid decode candidate found.")
-        return None
+        if not candidates:
+            print("[DECODE] No valid decode candidate found.")
+            return None
 
-    best = max(candidates, key=lambda item: item.score)
-    return finish_decode(best, write_output)
+        best = max(candidates, key=lambda item: item.score)
+        return finish_decode(best, write_output)
+    finally:
+        ALLOW_BRUTE_FORCE_RECOVERY = old_brute_force
+        ALLOW_OVERWRITE = old_overwrite
 
 
 def finish_decode(result: DecodeResult, write_output: bool) -> DecodeResult:
@@ -626,22 +748,36 @@ def finish_decode(result: DecodeResult, write_output: bool) -> DecodeResult:
         print("[DECODE] Decompression successful.")
 
     if write_output:
-        with open(result.filename, "wb") as fh:
+        output_name = safe_output_filename(result.filename)
+        with open(output_name, "wb") as fh:
             fh.write(payload)
-        print(f"[DECODE] Wrote output file: {result.filename}")
+        print(f"[DECODE] Wrote output file: {output_name}")
         try:
             if result.uid or result.gid:
-                os.chown(result.filename, result.uid, result.gid)
+                os.chown(output_name, result.uid, result.gid)
             if result.mode:
-                os.chmod(result.filename, result.mode)
+                os.chmod(output_name, result.mode)
             if result.mtime:
-                os.utime(result.filename, (result.mtime, result.mtime))
+                os.utime(output_name, (result.mtime, result.mtime))
             print("[DECODE] Restored metadata where possible.")
         except PermissionError:
             print("[DECODE] Warning: insufficient privileges to restore owner/group.")
         except Exception as exc:
             print(f"[DECODE] Metadata restore failed: {exc}")
     return result
+
+
+def safe_output_filename(filename: str) -> str:
+    basename = os.path.basename(filename) or "decoded_output.bin"
+    if ALLOW_OVERWRITE or not os.path.exists(basename):
+        return basename
+    root, ext = os.path.splitext(basename)
+    for i in range(1, 10_000):
+        candidate = f"{root}.{i}{ext}"
+        if not os.path.exists(candidate):
+            print(f"[DECODE] Output exists; writing {candidate} instead of overwriting {basename}")
+            return candidate
+    raise RuntimeError(f"Could not find a free output filename for {basename}")
 
 
 def format_ts(value: int) -> str:
@@ -651,7 +787,9 @@ def format_ts(value: int) -> str:
 
 
 def decode_wav(filename: str, bitrate: int | None, mfsk: int | None,
-               interleave_depth: int | None, auto: bool) -> DecodeResult | None:
+               interleave_depth: int | None, auto: bool,
+               brute_force_recovery: bool = False,
+               overwrite: bool = False) -> DecodeResult | None:
     with wave.open(filename, "r") as wf:
         sample_rate = wf.getframerate()
         channels = wf.getnchannels()
@@ -660,7 +798,9 @@ def decode_wav(filename: str, bitrate: int | None, mfsk: int | None,
     if channels > 1:
         signal = signal.reshape(-1, channels)[:, 0]
     print(f"[DECODE] Loading WAV: {filename} @ {sample_rate}Hz")
-    return decode_signal(signal, bitrate, mfsk, sample_rate, interleave_depth, auto)
+    return decode_signal(signal, bitrate, mfsk, sample_rate, interleave_depth, auto,
+                         brute_force_recovery=brute_force_recovery,
+                         overwrite=overwrite)
 
 
 def detect_symbols(signal: np.ndarray, sym_duration: float, sample_rate: int, mfsk: int = 2) -> list[int]:
@@ -678,7 +818,9 @@ def detect_bits(signal: np.ndarray, bit_duration: float, sample_rate: int) -> li
     return symbols_to_bits(detect_symbols(signal, bit_duration, sample_rate, mfsk=2), mfsk=2)
 
 
-def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: int | None, auto: bool) -> None:
+def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: int | None,
+                      auto: bool, brute_force_recovery: bool = False,
+                      overwrite: bool = False) -> None:
     br = bitrate or DEFAULT_BITRATE
     block = int(SAMPLE_RATE * max(0.25, 32 / br))
     chunks = []
@@ -707,7 +849,9 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
         print("\n[DECODE] Stopped listening.")
 
     if chunks:
-        decode_signal(np.concatenate(chunks), bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto)
+        decode_signal(np.concatenate(chunks), bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
+                      brute_force_recovery=brute_force_recovery,
+                      overwrite=overwrite)
 
 
 def max_reliable_bitrate(mfsk: int) -> int:
@@ -753,6 +897,10 @@ def main() -> None:
                         help="Try common interleave depths while decoding.")
     parser.add_argument("--resync-interval", type=int, default=0,
                         help="Insert 64-bit resync markers every N encoded bytes. Not backward compatible.")
+    parser.add_argument("--brute-force-recovery", action="store_true",
+                        help="Try slow RS-prefix recovery when normal header-based recovery fails.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite an existing decoded output file instead of adding a numeric suffix.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--alwayscompress", "--always-compress", action="store_true", dest="always_compress")
     group.add_argument("--nocompress", "--no-compress", action="store_true", dest="no_compress")
@@ -795,17 +943,18 @@ def main() -> None:
         encode(packet, args.file, bitrate, mfsk, args.interleave_depth, args.resync_interval)
         return
 
-    bitrate = args.bitrate
-    mfsk = args.mfsk
+    auto_modulation = args.bitrate is None and args.mfsk is None
+    bitrate = None if auto_modulation else (args.bitrate or DEFAULT_BITRATE)
+    mfsk = None if auto_modulation else (args.mfsk or DEFAULT_MFSK)
     if bitrate and mfsk:
         bitrate = apply_bitrate_clamp(bitrate, mfsk, args.noclamp)
-    auto = bitrate is None or mfsk is None or args.auto_interleave
+    auto = auto_modulation or args.auto_interleave
     depth = None if args.auto_interleave else args.interleave_depth
     print("[MAIN] Entering decode mode" + (" (auto-detect)" if auto else ""))
     if args.file == "-":
-        record_and_decode(bitrate, mfsk, depth, auto)
+        record_and_decode(bitrate, mfsk, depth, auto, args.brute_force_recovery, args.overwrite)
     else:
-        decode_wav(args.file, bitrate, mfsk, depth, auto)
+        decode_wav(args.file, bitrate, mfsk, depth, auto, args.brute_force_recovery, args.overwrite)
 
 
 if __name__ == "__main__":
