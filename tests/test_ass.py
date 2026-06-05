@@ -148,6 +148,33 @@ class AssRoundTripTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_live_marker_detector_finds_end_marker_across_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            wav_path = os.path.join(td, "out.wav")
+            packet = ass.build_packet("inline_data.txt", b"live marker test", 0)
+            ass.encode(packet, wav_path, bitrate=1200, mfsk=2)
+            signal, sample_rate = read_wav(wav_path)
+            signal = np.concatenate([signal, np.zeros(sample_rate * 2, dtype=np.int16)])
+
+            block = int(sample_rate * max(0.25, 32 / 1200))
+            end_bits = ass.int_to_bits(ass.END_MARKER_WORD, 32) * 3
+            found = False
+            chunks = []
+            rolling_seconds = 1.0
+            rolling_chunk_count = max(1, int(np.ceil((sample_rate * rolling_seconds) / block)))
+            monitor_every_blocks = max(1, int(np.ceil(sample_rate / block)))
+
+            for block_no, start in enumerate(range(0, len(signal), block), start=1):
+                chunks.append(signal[start:start + block])
+                if block_no % monitor_every_blocks != 0:
+                    continue
+                rolling = np.concatenate(chunks[-rolling_chunk_count:])[-int(sample_rate * rolling_seconds):]
+                found = ass.marker_in_audio(rolling, end_bits, 1200, 2, sample_rate)
+                if found:
+                    break
+
+            self.assertTrue(found)
+
 
 if __name__ == "__main__":
     unittest.main()

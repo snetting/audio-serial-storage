@@ -215,6 +215,23 @@ The packet stores the original filename only as a basename, not a full source pa
 
 By default, decode will not overwrite an existing file. If `README.md` already exists, a decoded `README.md` is written as `README.1.md`, then `README.2.md`, and so on. Use `--overwrite` only when replacement is intentional.
 
+Live Decode vs WAV Decode
+-------------------------
+
+WAV decode and live decode use the same final packet recovery path: sync/timing search, Reed--Solomon correction, header parsing, decompression, and CRC validation.
+
+The difference is capture control:
+
+- WAV decode already has the complete recording, so it can run recovery over the whole file immediately.
+
+- Live decode must decide when enough audio has been captured. It therefore runs a lightweight rolling monitor that looks for sync and the repeated end marker while buffering the raw audio. Once capture stops, the buffered audio is passed to the same decoder used for WAV files.
+
+- If the live monitor misses the end marker, press `Ctrl+C` after playback finishes. The buffered audio is still decoded using the full decoder.
+
+- Live mode prints elapsed capture time, input level in dBFS, and stream overflow count. Very low level, clipping, or overflows usually indicate an audio-device/loopback problem rather than a packet-format problem.
+
+For cassette work, recording the cassette to WAV first and then running `./ass.py decode recording.wav ...` is often the more repeatable workflow. It avoids live auto-stop issues and lets you inspect, normalize, archive, or retry the same capture with different decode options. Live decode is useful when you want direct tape-to-file restore without creating an intermediate WAV.
+
 Sync And Timing Recovery
 ------------------------
 

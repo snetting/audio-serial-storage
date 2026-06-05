@@ -818,38 +818,103 @@ def detect_bits(signal: np.ndarray, bit_duration: float, sample_rate: int) -> li
     return symbols_to_bits(detect_symbols(signal, bit_duration, sample_rate, mfsk=2), mfsk=2)
 
 
+def live_preview_bits(signal: np.ndarray, bitrate: int, mfsk: int, sample_rate: int) -> list[int]:
+    # The current encoder emits int(sample_rate / bitrate) samples per symbol.
+    # Using nominal fractional SPS here drifts and misses live sync/end markers.
+    sps = max(8, int(sample_rate / float(bitrate)))
+    symbols = demodulate_symbols_fast(signal, sample_rate, mfsk, sps, sps / 2.0)
+    return symbols_to_bits(symbols, mfsk)
+
+
+def marker_in_audio(signal: np.ndarray, marker_bits: list[int], bitrate: int,
+                    mfsk: int, sample_rate: int) -> bool:
+    if len(signal) < int(sample_rate * 0.20):
+        return False
+    nominal_sps = sample_rate / float(bitrate)
+    sps_candidates = [max(8, int(nominal_sps)), nominal_sps, max(8, round(nominal_sps))]
+
+    seen = set()
+    for sps in sps_candidates:
+        key = round(float(sps), 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        phase_count = 4
+        for phase in np.linspace(sps * 0.20, sps * 1.20, phase_count):
+            bits = symbols_to_bits(demodulate_symbols_fast(signal, sample_rate, mfsk, sps, phase), mfsk)
+            if find_pattern(bits, marker_bits) is not None:
+                return True
+    return False
+
+
+def level_dbfs(signal: np.ndarray) -> float:
+    if len(signal) == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(signal.astype(np.float64) ** 2)) + 1e-12)
+    return max(-120.0, 20.0 * math.log10(rms / 32767.0))
+
+
 def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: int | None,
                       auto: bool, brute_force_recovery: bool = False,
                       overwrite: bool = False) -> None:
     br = bitrate or DEFAULT_BITRATE
+    tones = mfsk or DEFAULT_MFSK
     block = int(SAMPLE_RATE * max(0.25, 32 / br))
+    rolling_seconds = 1.0
+    rolling_chunk_count = max(1, int(math.ceil((SAMPLE_RATE * rolling_seconds) / block)))
+    monitor_every_blocks = max(1, int(math.ceil(SAMPLE_RATE / block)))
     chunks = []
     line_buffer = []
+    sync_bits = int_to_bits(SYNC_WORD, 32)
     end_bits = int_to_bits(END_MARKER_WORD, 32)
     recent = []
+    sync_seen = False
+    blocks_read = 0
+    overflows = 0
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
+        print(f"[DECODE] Live preview: {br} symbols/s, {tones}-FSK")
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1) as stream:
             while True:
-                block_data, _ = stream.read(block)
+                block_data, overflowed = stream.read(block)
+                if overflowed:
+                    overflows += 1
                 sig = (block_data[:, 0] * 32767).astype(np.int16)
                 chunks.append(sig)
-                preview_bits = detect_bits(sig, 1 / br, SAMPLE_RATE)
+                blocks_read += 1
+                preview_bits = live_preview_bits(sig, br, tones, SAMPLE_RATE)
                 for bit in preview_bits:
                     line_buffer.append("*" if bit else ".")
                     recent.append(bit)
                     recent = recent[-96:]
-                sys.stdout.write("\r" + "".join(line_buffer[-80:]))
+                check_markers = blocks_read % monitor_every_blocks == 0
+                rolling = None
+                if check_markers:
+                    rolling = np.concatenate(chunks[-rolling_chunk_count:])[-int(SAMPLE_RATE * rolling_seconds):]
+                    if not sync_seen and marker_in_audio(rolling, sync_bits, br, tones, SAMPLE_RATE):
+                        sync_seen = True
+                        sys.stdout.write("\n[DECODE] Live: sync detected.\n")
+                        sys.stdout.flush()
+                elapsed = sum(len(chunk) for chunk in chunks) / SAMPLE_RATE
+                overflow_msg = f" overflows={overflows}" if overflows else ""
+                sys.stdout.write(
+                    "\r"
+                    + "".join(line_buffer[-80:])
+                    + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS{overflow_msg}"
+                )
                 sys.stdout.flush()
-                if len(recent) >= 96 and recent[-96:] == end_bits * 3:
+                if check_markers and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE):
                     print("\n[DECODE] End marker detected.")
                     break
     except KeyboardInterrupt:
         print("\n[DECODE] Stopped listening.")
 
     if chunks:
-        decode_signal(np.concatenate(chunks), bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
+        full = np.concatenate(chunks)
+        print(f"[DECODE] Captured {len(full) / SAMPLE_RATE:.2f}s, peak={np.max(np.abs(full))}, "
+              f"rms={level_dbfs(full):.1f} dBFS")
+        decode_signal(full, bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
                       brute_force_recovery=brute_force_recovery,
                       overwrite=overwrite)
 
