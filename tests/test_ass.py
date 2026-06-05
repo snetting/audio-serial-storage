@@ -175,6 +175,13 @@ class AssRoundTripTests(unittest.TestCase):
 
             self.assertTrue(found)
 
+    def test_quiet_live_capture_is_normalized_before_decode(self):
+        quiet = np.array([0, 100, -100, 200, -200], dtype=np.int16)
+        normalized = ass.normalize_capture_if_quiet(quiet)
+
+        self.assertGreater(np.max(np.abs(normalized)), np.max(np.abs(quiet)))
+        self.assertEqual(normalized.dtype, np.int16)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -854,9 +854,45 @@ def level_dbfs(signal: np.ndarray) -> float:
     return max(-120.0, 20.0 * math.log10(rms / 32767.0))
 
 
+def normalize_capture_if_quiet(signal: np.ndarray) -> np.ndarray:
+    peak = int(np.max(np.abs(signal))) if len(signal) else 0
+    if peak == 0:
+        return signal
+    if peak < 4096:
+        gain = min(32767.0 / peak * 0.8, 32.0)
+        print(f"[DECODE] Live level is low; applying {gain:.1f}x gain before final decode.")
+        return np.clip(signal.astype(np.float64) * gain, -32768, 32767).astype(np.int16)
+    return signal
+
+
+def remove_dc_offset(signal: np.ndarray) -> np.ndarray:
+    if len(signal) == 0:
+        return signal
+    mean = float(np.mean(signal.astype(np.float64)))
+    if abs(mean) < 1.0:
+        return signal
+    corrected = signal.astype(np.float64) - mean
+    return np.clip(corrected, -32768, 32767).astype(np.int16)
+
+
+def write_capture_wav(filename: str, signal: np.ndarray, sample_rate: int) -> None:
+    with wave.open(filename, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(signal.astype(np.int16).tobytes())
+    print(f"[DECODE] Saved live capture WAV: {filename}")
+
+
+def print_audio_devices() -> None:
+    print(sd.query_devices())
+    print(f"\nDefault device: {sd.default.device}")
+
+
 def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: int | None,
                       auto: bool, brute_force_recovery: bool = False,
-                      overwrite: bool = False) -> None:
+                      overwrite: bool = False, input_device=None,
+                      debug_capture: str | None = None) -> None:
     br = bitrate or DEFAULT_BITRATE
     tones = mfsk or DEFAULT_MFSK
     block = int(SAMPLE_RATE * max(0.25, 32 / br))
@@ -871,11 +907,14 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
     sync_seen = False
     blocks_read = 0
     overflows = 0
+    status = "waiting"
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
         print(f"[DECODE] Live preview: {br} symbols/s, {tones}-FSK")
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1) as stream:
+        if input_device is not None:
+            print(f"[DECODE] Input device: {input_device}")
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, device=input_device) as stream:
             while True:
                 block_data, overflowed = stream.read(block)
                 if overflowed:
@@ -894,29 +933,52 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                     rolling = np.concatenate(chunks[-rolling_chunk_count:])[-int(SAMPLE_RATE * rolling_seconds):]
                     if not sync_seen and marker_in_audio(rolling, sync_bits, br, tones, SAMPLE_RATE):
                         sync_seen = True
-                        sys.stdout.write("\n[DECODE] Live: sync detected.\n")
-                        sys.stdout.flush()
+                        status = "sync"
                 elapsed = sum(len(chunk) for chunk in chunks) / SAMPLE_RATE
                 overflow_msg = f" overflows={overflows}" if overflows else ""
                 sys.stdout.write(
                     "\r"
                     + "".join(line_buffer[-80:])
-                    + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS{overflow_msg}"
+                    + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS status={status}{overflow_msg}"
+                    + "\033[K"
                 )
                 sys.stdout.flush()
                 if check_markers and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE):
-                    print("\n[DECODE] End marker detected.")
+                    status = "end"
+                    sys.stdout.write(
+                        "\r"
+                        + "".join(line_buffer[-80:])
+                        + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS status={status}{overflow_msg}"
+                        + "\033[K\n"
+                    )
+                    sys.stdout.flush()
                     break
     except KeyboardInterrupt:
         print("\n[DECODE] Stopped listening.")
 
     if chunks:
         full = np.concatenate(chunks)
-        print(f"[DECODE] Captured {len(full) / SAMPLE_RATE:.2f}s, peak={np.max(np.abs(full))}, "
-              f"rms={level_dbfs(full):.1f} dBFS")
-        decode_signal(full, bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
-                      brute_force_recovery=brute_force_recovery,
-                      overwrite=overwrite)
+        peak = int(np.max(np.abs(full)))
+        rms = level_dbfs(full)
+        print(f"[DECODE] Captured {len(full) / SAMPLE_RATE:.2f}s, peak={peak}, rms={rms:.1f} dBFS")
+        if debug_capture:
+            write_capture_wav(debug_capture, full, SAMPLE_RATE)
+        if peak > 32000:
+            print("[DECODE] Warning: capture is close to clipping. Reduce playback/capture gain if decode fails.")
+        if peak < 1024 or rms < -60.0:
+            print("[DECODE] Warning: captured level is very low. Check that the loopback/tape device is "
+                  "selected as input and raise playback/capture gain.")
+        full = normalize_capture_if_quiet(full)
+        result = decode_signal(full, bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
+                               brute_force_recovery=brute_force_recovery,
+                               overwrite=overwrite)
+        if result is None:
+            corrected = remove_dc_offset(full)
+            if not np.array_equal(corrected, full):
+                print("[DECODE] Retrying live decode after DC offset removal.")
+                decode_signal(corrected, bitrate, mfsk, SAMPLE_RATE, interleave_depth, auto,
+                              brute_force_recovery=brute_force_recovery,
+                              overwrite=overwrite)
 
 
 def max_reliable_bitrate(mfsk: int) -> int:
@@ -949,8 +1011,8 @@ def main() -> None:
         prog="ass.py",
         description="Audio Serial Storage: FSK/MFSK WAV encoder and decoder with RS ECC",
     )
-    parser.add_argument("mode", choices=["encode", "decode"])
-    parser.add_argument("file", help="Output WAV for encode; input WAV or '-' for decode")
+    parser.add_argument("mode", nargs="?", choices=["encode", "decode"])
+    parser.add_argument("file", nargs="?", help="Output WAV for encode; input WAV or '-' for decode")
     parser.add_argument("--data", help="Inline string to encode")
     parser.add_argument("--inputfile", help="Path to input file to encode")
     parser.add_argument("--bitrate", type=int, help=f"Symbol rate (default encode: {DEFAULT_BITRATE}; decode: auto)")
@@ -966,6 +1028,12 @@ def main() -> None:
                         help="Try slow RS-prefix recovery when normal header-based recovery fails.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite an existing decoded output file instead of adding a numeric suffix.")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List sounddevice audio devices and exit.")
+    parser.add_argument("--input-device",
+                        help="Input device index or name for live decode. Use --list-devices to inspect choices.")
+    parser.add_argument("--debug-capture",
+                        help="Write the raw live capture buffer to this WAV file before final decode.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--alwayscompress", "--always-compress", action="store_true", dest="always_compress")
     group.add_argument("--nocompress", "--no-compress", action="store_true", dest="no_compress")
@@ -973,6 +1041,11 @@ def main() -> None:
     parser.set_defaults(auto_compress=True)
 
     args = parser.parse_args()
+    if args.list_devices:
+        print_audio_devices()
+        return
+    if args.mode is None or args.file is None:
+        parser.error("mode and file are required unless --list-devices is used")
     if args.interleave_depth < 1:
         parser.error("--interleave-depth must be >= 1")
     if args.resync_interval < 0:
@@ -1017,7 +1090,8 @@ def main() -> None:
     depth = None if args.auto_interleave else args.interleave_depth
     print("[MAIN] Entering decode mode" + (" (auto-detect)" if auto else ""))
     if args.file == "-":
-        record_and_decode(bitrate, mfsk, depth, auto, args.brute_force_recovery, args.overwrite)
+        record_and_decode(bitrate, mfsk, depth, auto, args.brute_force_recovery,
+                          args.overwrite, args.input_device, args.debug_capture)
     else:
         decode_wav(args.file, bitrate, mfsk, depth, auto, args.brute_force_recovery, args.overwrite)
 

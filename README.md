@@ -108,7 +108,8 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
              [--alwayscompress | --nocompress | --autocompress] 
              [--noclamp] [--interleave-depth N] [--auto-interleave]
              [--resync-interval N] [--brute-force-recovery]
-             [--overwrite] file
+             [--overwrite] [--list-devices] [--input-device DEVICE]
+             [--debug-capture FILE] file
 ```
 
 -   **Positional arguments**:
@@ -141,6 +142,12 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
     -   `--overwrite` : when decoding, overwrite an existing output file. By default the decoder adds a numeric suffix to avoid clobbering files.
 
+    -   `--list-devices` : list available audio devices and exit.
+
+    -   `--input-device DEVICE` : use a specific sounddevice input device index or name for live decode.
+
+    -   `--debug-capture FILE` : save the raw live input buffer to a WAV before final decode. Use this when live sync/end is detected but final decode fails.
+
     -   **Compression modes** (mutually exclusive):
 
         -   `--alwayscompress` : Always apply LZMA
@@ -172,6 +179,10 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
 # Decode live from mic
 ./ass.py decode - --bitrate 1200 --mfsk 2
+
+# List audio devices and pick a loopback/capture source for live decode
+./ass.py --list-devices
+./ass.py decode - --bitrate 1200 --input-device 3
 
 # Experimental 8-FSK at 100 bps bit-rate (effectively 300 bps)
 ./ass.py encode out-mfsk.wav --inputfile data.bin --bitrate 100 --mfsk 8
@@ -229,6 +240,14 @@ The difference is capture control:
 - If the live monitor misses the end marker, press `Ctrl+C` after playback finishes. The buffered audio is still decoded using the full decoder.
 
 - Live mode prints elapsed capture time, input level in dBFS, and stream overflow count. Very low level, clipping, or overflows usually indicate an audio-device/loopback problem rather than a packet-format problem.
+
+- As a rough guide, live capture RMS around `-35` to `-15 dBFS` is usually more plausible than `-70 dBFS`. A capture showing peak values below about `1000` or RMS below `-60 dBFS` is probably the wrong input source, muted monitor, or too little loopback/tape gain.
+
+- If the signal is quiet but nonzero, ASS applies temporary gain before final live-buffer decode. This cannot recover a recording that is mostly noise or the wrong device.
+
+- Captures close to full scale can also fail. If peak is near `32767` or RMS is above about `-10 dBFS`, reduce playback/capture gain to avoid clipping the FSK tones.
+
+- If live mode reports sync/end but final decode fails, rerun with `--debug-capture live-debug.wav`, then decode that file with `./ass.py decode live-debug.wav --bitrate ...`. This confirms whether the problem is live capture quality or final decoder recovery.
 
 For cassette work, recording the cassette to WAV first and then running `./ass.py decode recording.wav ...` is often the more repeatable workflow. It avoids live auto-stop issues and lets you inspect, normalize, archive, or retry the same capture with different decode options. Live decode is useful when you want direct tape-to-file restore without creating an intermediate WAV.
 
