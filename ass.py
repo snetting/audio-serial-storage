@@ -908,6 +908,7 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
     blocks_read = 0
     overflows = 0
     status = "waiting"
+    tail_blocks_remaining = None
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
@@ -943,8 +944,14 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                     + "\033[K"
                 )
                 sys.stdout.flush()
-                if check_markers and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE):
+                if (
+                    check_markers
+                    and sync_seen
+                    and tail_blocks_remaining is None
+                    and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE)
+                ):
                     status = "end"
+                    tail_blocks_remaining = max(1, int(math.ceil(SAMPLE_RATE / block)))
                     sys.stdout.write(
                         "\r"
                         + "".join(line_buffer[-80:])
@@ -952,7 +959,11 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                         + "\033[K\n"
                     )
                     sys.stdout.flush()
-                    break
+                    print("[DECODE] End marker detected; capturing 1s tail.")
+                if tail_blocks_remaining is not None:
+                    tail_blocks_remaining -= 1
+                    if tail_blocks_remaining <= 0:
+                        break
     except KeyboardInterrupt:
         print("\n[DECODE] Stopped listening.")
 
