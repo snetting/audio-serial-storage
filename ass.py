@@ -909,6 +909,7 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
     overflows = 0
     status = "waiting"
     tail_blocks_remaining = None
+    pending_end_validation = False
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
@@ -950,8 +951,9 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                     and tail_blocks_remaining is None
                     and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE)
                 ):
-                    status = "end"
+                    status = "end?"
                     tail_blocks_remaining = max(1, int(math.ceil(SAMPLE_RATE / block)))
+                    pending_end_validation = True
                     sys.stdout.write(
                         "\r"
                         + "".join(line_buffer[-80:])
@@ -959,11 +961,34 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                         + "\033[K\n"
                     )
                     sys.stdout.flush()
-                    print("[DECODE] End marker detected; capturing 1s tail.")
+                    print("[DECODE] End marker candidate detected; capturing 1s tail before validation.")
                 if tail_blocks_remaining is not None:
                     tail_blocks_remaining -= 1
                     if tail_blocks_remaining <= 0:
-                        break
+                        if pending_end_validation:
+                            candidate = np.concatenate(chunks)
+                            print("[DECODE] Validating live capture before auto-stop...")
+                            result = decode_signal(
+                                candidate,
+                                bitrate,
+                                mfsk,
+                                SAMPLE_RATE,
+                                interleave_depth,
+                                auto,
+                                write_output=False,
+                                brute_force_recovery=brute_force_recovery,
+                                overwrite=overwrite,
+                            )
+                            if result is not None:
+                                status = "end"
+                                print("[DECODE] End marker validated.")
+                                break
+                            print("[DECODE] End marker candidate did not validate; continuing capture.")
+                            status = "sync"
+                            tail_blocks_remaining = None
+                            pending_end_validation = False
+                        else:
+                            break
     except KeyboardInterrupt:
         print("\n[DECODE] Stopped listening.")
 
