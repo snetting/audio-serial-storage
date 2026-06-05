@@ -18,7 +18,7 @@ Features
 
 -   **CRC32** payload integrity check
 
--   **Live bit‑stream display** in console
+-   **Optional live bit‑stream display** in console
 
 -   **Read/write from WAV file or live audio input**
 
@@ -109,7 +109,7 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
              [--noclamp] [--interleave-depth N] [--auto-interleave]
              [--resync-interval N] [--brute-force-recovery]
              [--overwrite] [--list-devices] [--input-device DEVICE]
-             [--debug-capture FILE] file
+             [--debug-capture FILE] [--live-monitor] file
 ```
 
 -   **Positional arguments**:
@@ -148,6 +148,8 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
     -   `--debug-capture FILE` : save the raw live input buffer to a WAV before final decode. Use this when live sync/end is detected but final decode fails.
 
+    -   `--live-monitor` : enable experimental live bit-scope, rolling sync/end marker checks, and auto-stop. Without this option, live decode records until `Ctrl+C`.
+
     -   **Compression modes** (mutually exclusive):
 
         -   `--alwayscompress` : Always apply LZMA
@@ -177,8 +179,11 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 # Decode from file with auto-detection
 ./ass.py decode input.wav
 
-# Decode live from mic
+# Decode live from mic/loopback. Stop with Ctrl+C after playback finishes.
 ./ass.py decode - --bitrate 1200 --mfsk 2
+
+# Optional experimental live scope and auto-stop
+./ass.py decode - --bitrate 1200 --mfsk 2 --live-monitor
 
 # List audio devices and pick a loopback/capture source for live decode
 ./ass.py --list-devices
@@ -235,9 +240,9 @@ The difference is capture control:
 
 - WAV decode already has the complete recording, so it can run recovery over the whole file immediately.
 
-- Live decode must decide when enough audio has been captured. It therefore runs a lightweight rolling monitor that looks for sync and the repeated end marker while buffering the raw audio. Once capture stops, the buffered audio is passed to the same decoder used for WAV files.
+- Default live decode buffers raw audio until you press `Ctrl+C`. Start decode, play the WAV or tape, then press `Ctrl+C` after playback finishes. The buffered audio is then passed to the same decoder used for WAV files.
 
-- If the live monitor misses the end marker, press `Ctrl+C` after playback finishes. The buffered audio is still decoded using the full decoder.
+- `--live-monitor` enables an experimental rolling bit-scope plus sync/end marker checks and auto-stop. This is useful for diagnostics, but the default mode avoids doing demodulation work while recording.
 
 - Live mode prints elapsed capture time, input level in dBFS, and stream overflow count. Very low level, clipping, or overflows usually indicate an audio-device/loopback problem rather than a packet-format problem.
 
@@ -247,9 +252,9 @@ The difference is capture control:
 
 - Captures close to full scale can also fail. If peak is near `32767` or RMS is above about `-10 dBFS`, reduce playback/capture gain to avoid clipping the FSK tones.
 
-- If live mode reports sync/end but final decode fails, rerun with `--debug-capture live-debug.wav`, then decode that file with `./ass.py decode live-debug.wav --bitrate ...`. This confirms whether the problem is live capture quality or final decoder recovery.
+- If live mode fails, rerun with `--debug-capture live-debug.wav`, then decode that file with `./ass.py decode live-debug.wav --bitrate ...`. This confirms whether the problem is live capture quality or final decoder recovery.
 
-For cassette work, recording the cassette to WAV first and then running `./ass.py decode recording.wav ...` is often the more repeatable workflow. It avoids live auto-stop issues and lets you inspect, normalize, archive, or retry the same capture with different decode options. Live decode is useful when you want direct tape-to-file restore without creating an intermediate WAV.
+For cassette work, recording the cassette to WAV first and then running `./ass.py decode recording.wav ...` is often the more repeatable workflow. It lets you inspect, normalize, archive, or retry the same capture with different decode options. Live decode is useful when you want direct tape-to-file restore without creating an intermediate WAV.
 
 Sync And Timing Recovery
 ------------------------

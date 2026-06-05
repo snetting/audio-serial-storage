@@ -524,6 +524,67 @@ def trim_active_region(signal: np.ndarray, sample_rate: int) -> np.ndarray:
     return trimmed
 
 
+def direct_detect_symbols(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: int) -> list[int]:
+    freqs = get_mfsk_freqs(mfsk)
+    samples_per_symbol = max(1, int(sample_rate * (1.0 / bitrate)))
+    symbols = []
+    for i in range(0, len(signal), samples_per_symbol):
+        chunk = signal[i:i + samples_per_symbol]
+        if len(chunk) < samples_per_symbol:
+            break
+        fft = np.abs(np.fft.fft(chunk))
+        freqs_axis = np.fft.fftfreq(len(chunk), 1 / sample_rate)
+        half = len(fft) // 2
+        peak_idx = int(np.argmax(fft[:half]))
+        peak_freq = abs(freqs_axis[peak_idx])
+        symbols.append(min(range(mfsk), key=lambda x: abs(peak_freq - freqs[x])))
+    return symbols
+
+
+def direct_sync_candidate(signal: np.ndarray, sample_rate: int, bitrate: int,
+                          mfsk: int, interleave_depth: int) -> DecodeResult | None:
+    if interleave_depth != 1:
+        return None
+    bits = symbols_to_bits(direct_detect_symbols(signal, sample_rate, bitrate, mfsk), mfsk)
+    sync_pos = find_pattern(bits, int_to_bits(SYNC_WORD, 32))
+    if sync_pos is None:
+        return None
+
+    data_bits = bits[sync_pos + 32:]
+    end_idx = find_pattern(data_bits, int_to_bits(END_MARKER_WORD, 32))
+    if end_idx is not None:
+        data_bits = data_bits[:end_idx]
+
+    raw = bits_to_bytes(data_bits)
+    decoded, rs_stats = rs_decode_blocks(raw)
+    try:
+        fname, payload, crc, backup_ts, ctime, mtime, uid, gid, mode, flags = parse_packet(decoded)
+    except Exception:
+        return None
+    if (zlib.crc32(payload) & 0xFFFFFFFF) != crc:
+        return None
+
+    return DecodeResult(
+        filename=fname,
+        payload=payload,
+        crc=crc,
+        backup_ts=backup_ts,
+        ctime=ctime,
+        mtime=mtime,
+        uid=uid,
+        gid=gid,
+        mode=mode,
+        flags=flags,
+        bitrate=bitrate,
+        mfsk=mfsk,
+        interleave_depth=interleave_depth,
+        resync_markers=0,
+        demodulator="direct-sync",
+        rs_stats=rs_stats,
+        score=125 if end_idx is not None else 110,
+    )
+
+
 def decode_candidate(signal: np.ndarray, sample_rate: int, bitrate: int, mfsk: int,
                      interleave_depth: int, use_pll: bool) -> DecodeResult | None:
     demod_name = "pll" if use_pll else "fixed"
@@ -706,6 +767,13 @@ def decode_signal(signal: np.ndarray, bitrate: int | None, mfsk: int | None,
                 idx += 1
                 print(f"[DECODE] Candidate {idx}/{total}: {br} symbols/s, {tones}-FSK")
                 for depth in depths:
+                    direct_result = direct_sync_candidate(signal, sample_rate, br, tones, depth)
+                    if direct_result:
+                        candidates.append(direct_result)
+                        print(f"[DECODE] Candidate OK: {br} symbols/s, {tones}-FSK, "
+                              f"depth {depth}, direct-sync")
+                        if not auto or direct_result.score >= 120:
+                            return finish_decode(direct_result, write_output)
                     for use_pll in (False, True):
                         result = decode_candidate(signal, sample_rate, br, tones, depth, use_pll)
                         if result:
@@ -892,13 +960,15 @@ def print_audio_devices() -> None:
 def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: int | None,
                       auto: bool, brute_force_recovery: bool = False,
                       overwrite: bool = False, input_device=None,
-                      debug_capture: str | None = None) -> None:
+                      debug_capture: str | None = None,
+                      live_monitor: bool = False) -> None:
     br = bitrate or DEFAULT_BITRATE
     tones = mfsk or DEFAULT_MFSK
-    block = int(SAMPLE_RATE * max(0.25, 32 / br))
+    block = int(SAMPLE_RATE * (1.0 / br) * 10)
     rolling_seconds = 1.0
     rolling_chunk_count = max(1, int(math.ceil((SAMPLE_RATE * rolling_seconds) / block)))
     monitor_every_blocks = max(1, int(math.ceil(SAMPLE_RATE / block)))
+    status_every_blocks = max(1, int(math.ceil((SAMPLE_RATE * 0.5) / block)))
     chunks = []
     line_buffer = []
     sync_bits = int_to_bits(SYNC_WORD, 32)
@@ -913,7 +983,10 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
-        print(f"[DECODE] Live preview: {br} symbols/s, {tones}-FSK")
+        if live_monitor:
+            print(f"[DECODE] Live monitor: {br} symbols/s, {tones}-FSK")
+        else:
+            print("[DECODE] Live monitor disabled; press Ctrl+C after playback finishes.")
         if input_device is not None:
             print(f"[DECODE] Input device: {input_device}")
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, device=input_device) as stream:
@@ -924,29 +997,33 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                 sig = (block_data[:, 0] * 32767).astype(np.int16)
                 chunks.append(sig)
                 blocks_read += 1
-                preview_bits = live_preview_bits(sig, br, tones, SAMPLE_RATE)
-                for bit in preview_bits:
-                    line_buffer.append("*" if bit else ".")
-                    recent.append(bit)
-                    recent = recent[-96:]
+                if live_monitor:
+                    preview_bits = live_preview_bits(sig, br, tones, SAMPLE_RATE)
+                    for bit in preview_bits:
+                        line_buffer.append("*" if bit else ".")
+                        recent.append(bit)
+                        recent = recent[-96:]
                 check_markers = blocks_read % monitor_every_blocks == 0
                 rolling = None
-                if check_markers:
+                if live_monitor and check_markers:
                     rolling = np.concatenate(chunks[-rolling_chunk_count:])[-int(SAMPLE_RATE * rolling_seconds):]
                     if not sync_seen and marker_in_audio(rolling, sync_bits, br, tones, SAMPLE_RATE):
                         sync_seen = True
                         status = "sync"
                 elapsed = sum(len(chunk) for chunk in chunks) / SAMPLE_RATE
                 overflow_msg = f" overflows={overflows}" if overflows else ""
-                sys.stdout.write(
-                    "\r"
-                    + "".join(line_buffer[-80:])
-                    + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS status={status}{overflow_msg}"
-                    + "\033[K"
-                )
-                sys.stdout.flush()
+                if blocks_read % status_every_blocks == 0:
+                    scope = "".join(line_buffer[-80:]) if live_monitor else ""
+                    sys.stdout.write(
+                        "\r"
+                        + scope
+                        + f" | {elapsed:6.1f}s {level_dbfs(sig):6.1f} dBFS status={status}{overflow_msg}"
+                        + "\033[K"
+                    )
+                    sys.stdout.flush()
                 if (
-                    check_markers
+                    live_monitor
+                    and check_markers
                     and sync_seen
                     and tail_blocks_remaining is None
                     and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE)
@@ -1070,6 +1147,8 @@ def main() -> None:
                         help="Input device index or name for live decode. Use --list-devices to inspect choices.")
     parser.add_argument("--debug-capture",
                         help="Write the raw live capture buffer to this WAV file before final decode.")
+    parser.add_argument("--live-monitor", action="store_true",
+                        help="Enable experimental live sync/end marker monitoring and auto-stop.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--alwayscompress", "--always-compress", action="store_true", dest="always_compress")
     group.add_argument("--nocompress", "--no-compress", action="store_true", dest="no_compress")
@@ -1127,7 +1206,7 @@ def main() -> None:
     print("[MAIN] Entering decode mode" + (" (auto-detect)" if auto else ""))
     if args.file == "-":
         record_and_decode(bitrate, mfsk, depth, auto, args.brute_force_recovery,
-                          args.overwrite, args.input_device, args.debug_capture)
+                          args.overwrite, args.input_device, args.debug_capture, args.live_monitor)
     else:
         decode_wav(args.file, bitrate, mfsk, depth, auto, args.brute_force_recovery, args.overwrite)
 
