@@ -18,7 +18,7 @@ Features
 
 -   **CRC32** payload integrity check
 
--   **Optional live bit‑stream display** in console
+-   **Live bit‑stream display** and end-marker auto-stop in console
 
 -   **Read/write from WAV file or live audio input**
 
@@ -109,7 +109,7 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
              [--noclamp] [--interleave-depth N] [--auto-interleave]
              [--resync-interval N] [--brute-force-recovery]
              [--overwrite] [--list-devices] [--input-device DEVICE]
-             [--debug-capture FILE] [--live-monitor] file
+             [--debug-capture FILE] [--live-monitor] [--no-live-monitor] file
 ```
 
 -   **Positional arguments**:
@@ -148,7 +148,9 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 
     -   `--debug-capture FILE` : save the raw live input buffer to a WAV before final decode. Use this when live sync/end is detected but final decode fails.
 
-    -   `--live-monitor` : enable experimental live bit-scope, rolling sync/end marker checks, and auto-stop. Without this option, live decode records until `Ctrl+C`.
+    -   `--live-monitor` : enable live bit-scope, rolling sync/end marker checks, and auto-stop. This is enabled by default.
+
+    -   `--no-live-monitor` : disable live monitoring and record until `Ctrl+C`, then decode the capture.
 
     -   **Compression modes** (mutually exclusive):
 
@@ -179,11 +181,11 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 # Decode from file with auto-detection
 ./ass.py decode input.wav
 
-# Decode live from mic/loopback. Stop with Ctrl+C after playback finishes.
+# Decode live from mic/loopback. Stops automatically after the repeated end marker.
 ./ass.py decode - --bitrate 1200 --mfsk 2
 
-# Optional experimental live scope and auto-stop
-./ass.py decode - --bitrate 1200 --mfsk 2 --live-monitor
+# Capture-only live decode. Stop with Ctrl+C after playback finishes.
+./ass.py decode - --bitrate 1200 --mfsk 2 --no-live-monitor
 
 # List audio devices and pick a loopback/capture source for live decode
 ./ass.py --list-devices
@@ -200,6 +202,24 @@ usage: ass.py [-h] {encode,decode} [--data DATA] [--inputfile INPUTFILE]
 ./ass.py decode interleaved.wav --auto-interleave
 
 ```
+
+GUI Launcher
+------------
+
+The GUI lives in a separate file and shells out to the existing CLI. It is experimental by design, so the core decoder stays untouched.
+
+```
+python3 ass_gui.py
+```
+
+The GUI defaults to the cassette-friendly preset:
+
+- `1200` symbols/s
+- `2-FSK`
+- automatic compression
+- live monitor and end-marker auto-stop enabled
+
+The preset is intentionally conservative for the current audio cassette format. If you need a different encoding, the GUI exposes the full set of CLI options.
 
 # Bitrate Clamping
 
@@ -240,9 +260,9 @@ The difference is capture control:
 
 - WAV decode already has the complete recording, so it can run recovery over the whole file immediately.
 
-- Default live decode buffers raw audio until you press `Ctrl+C`. Start decode, play the WAV or tape, then press `Ctrl+C` after playback finishes. The buffered audio is then passed to the same decoder used for WAV files.
+- Default live decode runs a rolling bit-scope plus sync/end marker checks while buffering raw audio. When the repeated end marker is detected, it captures a short tail and then passes the buffered audio to the same decoder used for WAV files.
 
-- `--live-monitor` enables an experimental rolling bit-scope plus sync/end marker checks and auto-stop. This is useful for diagnostics, but the default mode avoids doing demodulation work while recording.
+- `--no-live-monitor` disables the rolling monitor. In that mode, start decode, play the WAV or tape, then press `Ctrl+C` after playback finishes.
 
 - Live mode prints elapsed capture time, input level in dBFS, and stream overflow count. Very low level, clipping, or overflows usually indicate an audio-device/loopback problem rather than a packet-format problem.
 
@@ -250,7 +270,7 @@ The difference is capture control:
 
 - If the signal is quiet but nonzero, ASS applies temporary gain before final live-buffer decode. This cannot recover a recording that is mostly noise or the wrong device.
 
-- Captures close to full scale can also fail. If peak is near `32767` or RMS is above about `-10 dBFS`, reduce playback/capture gain to avoid clipping the FSK tones.
+- Captures close to full scale can also fail, even if an older loose decoder appeared to accept them. If peak is near `32767` or RMS is above about `-10 dBFS`, reduce playback/capture gain to avoid clipping the FSK tones. In loopback testing, a peak around `7000` and RMS around `-25 dBFS` is often safer than a near-clipped capture.
 
 - If live mode fails, rerun with `--debug-capture live-debug.wav`, then decode that file with `./ass.py decode live-debug.wav --bitrate ...`. This confirms whether the problem is live capture quality or final decoder recovery.
 

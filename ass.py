@@ -961,7 +961,7 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                       auto: bool, brute_force_recovery: bool = False,
                       overwrite: bool = False, input_device=None,
                       debug_capture: str | None = None,
-                      live_monitor: bool = False) -> None:
+                      live_monitor: bool = True) -> None:
     br = bitrate or DEFAULT_BITRATE
     tones = mfsk or DEFAULT_MFSK
     block = int(SAMPLE_RATE * (1.0 / br) * 10)
@@ -979,7 +979,6 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
     overflows = 0
     status = "waiting"
     tail_blocks_remaining = None
-    pending_end_validation = False
 
     try:
         print("[DECODE] Listening... Ctrl+C to stop.")
@@ -1028,9 +1027,8 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                     and tail_blocks_remaining is None
                     and marker_in_audio(rolling, end_bits * 3, br, tones, SAMPLE_RATE)
                 ):
-                    status = "end?"
+                    status = "end"
                     tail_blocks_remaining = max(1, int(math.ceil(SAMPLE_RATE / block)))
-                    pending_end_validation = True
                     sys.stdout.write(
                         "\r"
                         + "".join(line_buffer[-80:])
@@ -1038,34 +1036,11 @@ def record_and_decode(bitrate: int | None, mfsk: int | None, interleave_depth: i
                         + "\033[K\n"
                     )
                     sys.stdout.flush()
-                    print("[DECODE] End marker candidate detected; capturing 1s tail before validation.")
+                    print("[DECODE] End marker detected; capturing 1s tail.")
                 if tail_blocks_remaining is not None:
                     tail_blocks_remaining -= 1
                     if tail_blocks_remaining <= 0:
-                        if pending_end_validation:
-                            candidate = np.concatenate(chunks)
-                            print("[DECODE] Validating live capture before auto-stop...")
-                            result = decode_signal(
-                                candidate,
-                                bitrate,
-                                mfsk,
-                                SAMPLE_RATE,
-                                interleave_depth,
-                                auto,
-                                write_output=False,
-                                brute_force_recovery=brute_force_recovery,
-                                overwrite=overwrite,
-                            )
-                            if result is not None:
-                                status = "end"
-                                print("[DECODE] End marker validated.")
-                                break
-                            print("[DECODE] End marker candidate did not validate; continuing capture.")
-                            status = "sync"
-                            tail_blocks_remaining = None
-                            pending_end_validation = False
-                        else:
-                            break
+                        break
     except KeyboardInterrupt:
         print("\n[DECODE] Stopped listening.")
 
@@ -1147,8 +1122,10 @@ def main() -> None:
                         help="Input device index or name for live decode. Use --list-devices to inspect choices.")
     parser.add_argument("--debug-capture",
                         help="Write the raw live capture buffer to this WAV file before final decode.")
-    parser.add_argument("--live-monitor", action="store_true",
-                        help="Enable experimental live sync/end marker monitoring and auto-stop.")
+    parser.add_argument("--live-monitor", action="store_true", default=True,
+                        help="Enable live sync/end marker monitoring and auto-stop. Enabled by default.")
+    parser.add_argument("--no-live-monitor", action="store_false", dest="live_monitor",
+                        help="Disable live monitoring; record until Ctrl+C, then decode the capture.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--alwayscompress", "--always-compress", action="store_true", dest="always_compress")
     group.add_argument("--nocompress", "--no-compress", action="store_true", dest="no_compress")
